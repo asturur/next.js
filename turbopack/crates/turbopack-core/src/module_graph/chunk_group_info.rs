@@ -70,16 +70,95 @@ pub struct AsyncLoaderRelevantAvailability {
     /// observed here. So [`Self::canonicalize`] only removes chunk groups instead of producing a
     /// canonical value.
     pub reaches_activatable: bool,
+    /// Reachability tests for nested chunk groups. Available async loaders cut traversal before
+    /// their target is visited, so modules behind those cuts cannot affect this loader.
+    /// Collecting and activatable subgraphs retain the conservative unconditional closure.
+    pub conditional: Option<AsyncLoaderAvailabilityGraph>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ValueDebugFormat, NonLocalValue, Encode, Decode)]
+pub struct AsyncLoaderAvailabilityGraph {
+    pub root: u32,
+    pub nodes: Vec<AsyncLoaderAvailabilityNode>,
+    pub sets: Vec<Bitset>,
+    /// Global group indices ordered by stable chunk-group identity, not discovery order.
+    pub group_order: Vec<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ValueDebugFormat, NonLocalValue, Encode, Decode)]
+pub struct AsyncLoaderAvailabilityNode {
+    pub observed: Vec<u32>,
+    /// An edge is traversed only when its optional async loader is unavailable.
+    pub successors: Vec<(u32, Option<u32>)>,
+}
+
+impl AsyncLoaderAvailabilityGraph {
+    fn canonicalize(&self, available: &Bitset) -> Bitset {
+        let mut visited = Bitset::new();
+        let mut observed = Bitset::new();
+        let mut stack = vec![self.root];
+        while let Some(node) = stack.pop() {
+            if !visited.insert(node) {
+                continue;
+            }
+            let node = &self.nodes[node as usize];
+            observed.extend(node.observed.iter().copied());
+            for &(target, loader) in &node.successors {
+                if let Some(loader) = loader {
+                    observed.insert(loader);
+                    if !self.sets[loader as usize].is_disjoint(available) {
+                        continue;
+                    }
+                }
+                stack.push(target);
+            }
+        }
+        let mut union = Bitset::new();
+        let mut missed = Bitset::new();
+        let mut hits = Bitset::new();
+        for id in observed.iter() {
+            let set = &self.sets[id as usize];
+            union |= set;
+            if set.is_disjoint(available) {
+                missed |= set;
+            } else {
+                hits.insert(id);
+            }
+        }
+        let maximal = &union - &missed;
+        // The maximal representative can contain thousands of interchangeable groups. Every
+        // group later contributes identity reads to availability hashing, so that expansion
+        // creates substantial task bookkeeping even after equivalent loaders share a key.
+        // Keep a deterministic witness for each hit instead. Every choice belongs to `maximal`,
+        // so no missed test can become a hit. Every hit retains a witness. The choices depend
+        // only on the observed answers, preserving canonicalization and future union behavior.
+        let mut representative = Bitset::new();
+        for id in hits.iter() {
+            let set = &self.sets[id as usize];
+            if set.is_disjoint(&representative) {
+                let group = self
+                    .group_order
+                    .iter()
+                    .copied()
+                    .find(|group| set.contains(*group) && maximal.contains(*group))
+                    .expect("a hit must retain a witness");
+                representative.insert(group);
+            }
+        }
+        representative
+    }
 }
 
 impl AsyncLoaderRelevantAvailability {
     /// A replacement for `available` that answers every observed test the same way.
     ///
-    /// Usually it is canonical: everything in [`Self::chunk_groups`] except the members of observed
-    /// sets that `available` misses. A set that `available` hits keeps `set ∩ available` (those
-    /// chunk groups are in no missed set), and a missed set loses all of its members. The result
-    /// only depends on which sets are hit, so availabilities that make the same modules available
-    /// map to the same value. It can contain chunk groups that are not in `available`.
+    /// A conditional graph preserves reachable tests with a sparse deterministic representative.
+    /// Otherwise it is canonical: everything in [`Self::chunk_groups`] except the members of
+    /// observed sets that `available` misses. A set that `available` hits keeps `set ∩
+    /// available` (those chunk groups are in no missed set), and a missed set loses all of its
+    /// members. The result only depends on which sets are hit, so availabilities that make the
+    /// same modules available map to the same value. It can contain chunk groups that are not
+    /// in `available`.
     ///
     /// With [`Self::reaches_activatable`], it is `available ∩ chunk_groups` instead: a subset of
     /// `available`, so tests that aren't observed here can only lose availability (which emits a
@@ -87,6 +166,9 @@ impl AsyncLoaderRelevantAvailability {
     pub fn canonicalize(&self, available: &Bitset) -> Bitset {
         if self.reaches_activatable {
             return &self.chunk_groups & available;
+        }
+        if let Some(conditional) = &self.conditional {
+            return conditional.canonicalize(available);
         }
         let mut missed = Bitset::new();
         for observed in &self.observed_chunk_groups {
@@ -1028,6 +1110,20 @@ pub async fn compute_chunk_group_info(
             }
         }
 
+        // Sparse canonicalization must choose witnesses independently of graph discovery order.
+        // Resolve each group's stable identity once, rather than per availability combination.
+        let mut ordered_group_idents = chunk_groups_map
+            .keys()
+            .enumerate()
+            .map(async |(index, key)| Ok((key.ident_str(&chunk_groups_map.keys()).await?, index)))
+            .try_join()
+            .await?;
+        ordered_group_idents.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let mut group_ranks = vec![0u32; chunk_groups_map.len()];
+        for (rank, (_, index)) in ordered_group_idents.into_iter().enumerate() {
+            group_ranks[index] = rank as u32;
+        }
+
         let async_loader_relevant_availability = compute_async_loader_relevant_availability(
             &chunk_groups_map,
             &module_chunk_groups,
@@ -1035,6 +1131,7 @@ pub async fn compute_chunk_group_info(
             &async_references,
             &shared_references,
             collected_modules,
+            &group_ranks,
         )?;
 
         let chunk_group_clusters: Vec<Vec<u16>> = clusters
@@ -1142,6 +1239,7 @@ fn compute_async_loader_relevant_availability<'a>(
     async_references: &FxHashSet<AsyncReference>,
     shared_references: &FxHashSet<SharedReference>,
     collected_modules: &ReadRef<CollectedModules>,
+    group_ranks: &[u32],
 ) -> Result<FxHashMap<ResolvedVc<Box<dyn Module>>, AsyncLoaderRelevantAvailability>> {
     let _span = tracing::info_span!("compute async loader relevant availability").entered();
 
@@ -1179,6 +1277,8 @@ fn compute_async_loader_relevant_availability<'a>(
         .collect::<Bitset>();
     let mut successors: FxHashMap<u32, FxHashSet<u32>> = FxHashMap::default();
     let mut loader_sets: FxHashMap<u32, Bitset> = FxHashMap::default();
+    let mut conditional_successors: FxHashMap<u32, FxHashSet<(u32, Option<u32>)>> =
+        FxHashMap::default();
     let mut uses_entry_group = Bitset::new();
 
     for (parent, child) in async_references {
@@ -1194,6 +1294,10 @@ fn compute_async_loader_relevant_availability<'a>(
                 continue;
             }
             successors.entry(group).or_default().insert(target);
+            conditional_successors
+                .entry(group)
+                .or_default()
+                .insert((target, Some(loader_set)));
             loader_sets.entry(group).or_default().insert(loader_set);
         }
     }
@@ -1212,6 +1316,10 @@ fn compute_async_loader_relevant_availability<'a>(
             };
             let target = index_of(&key).context("Shared chunk group not found")?;
             successors.entry(group).or_default().insert(target);
+            conditional_successors
+                .entry(group)
+                .or_default()
+                .insert((target, None));
         }
     }
 
@@ -1240,6 +1348,10 @@ fn compute_async_loader_relevant_availability<'a>(
                     Some(target) => {
                         for group in collecting_groups.iter() {
                             successors.entry(group).or_default().insert(target);
+                            conditional_successors
+                                .entry(group)
+                                .or_default()
+                                .insert((target, None));
                         }
                     }
                     None => opaque |= &collecting_groups,
@@ -1289,6 +1401,19 @@ fn compute_async_loader_relevant_availability<'a>(
             direct_sets.entry(group).or_default().insert(set);
         }
     }
+
+    // Stable membership-set ordering is also required for deterministic greedy witnesses.
+    let stable_set_keys = observed_sets
+        .iter()
+        .map(|set| {
+            let mut key = set
+                .iter()
+                .map(|group| group_ranks[group as usize])
+                .collect::<Vec<_>>();
+            key.sort_unstable();
+            key
+        })
+        .collect::<Vec<_>>();
 
     // Close over the chunk group graph, one strongly connected component at a time. `tarjan_scc`
     // returns the components in reverse topological order, so the successors of a component are
@@ -1359,6 +1484,75 @@ fn compute_async_loader_relevant_availability<'a>(
             for set in &observed_chunk_groups {
                 chunk_groups |= set;
             }
+            let conditional = if !*reaches_activatable && !*uses_entry_group {
+                let mut visited = Bitset::new();
+                let mut stack = vec![index];
+                while let Some(group) = stack.pop() {
+                    if visited.insert(group) {
+                        stack.extend(successors.get(&group).into_iter().flatten().copied());
+                    }
+                }
+                let indices = visited
+                    .iter()
+                    .enumerate()
+                    .map(|(i, g)| (g, i as u32))
+                    .collect::<FxHashMap<_, _>>();
+                // Set IDs were interned in hash-map order. Sort their contents before
+                // storing the keyed value, so an unchanged graph compares equal.
+                let mut ordered_sets = sets.iter().collect::<Vec<_>>();
+                ordered_sets.sort_by(|a, b| {
+                    let a = &stable_set_keys[*a as usize];
+                    let b = &stable_set_keys[*b as usize];
+                    a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+                });
+                let local_set_ids = ordered_sets
+                    .iter()
+                    .enumerate()
+                    .map(|(i, set)| (*set, i as u32))
+                    .collect::<FxHashMap<_, _>>();
+                let local_sets = ordered_sets
+                    .iter()
+                    .map(|set| observed_sets[*set as usize].clone())
+                    .collect();
+                let local_set = |global: u32| local_set_ids[&global];
+                let nodes = visited
+                    .iter()
+                    .map(|group| {
+                        let mut observed = direct_sets
+                            .get(&group)
+                            .into_iter()
+                            .flat_map(|s| s.iter())
+                            .map(local_set)
+                            .collect::<Vec<_>>();
+                        observed.sort_unstable();
+                        let edges = conditional_successors
+                            .get(&group)
+                            .into_iter()
+                            .flatten()
+                            .copied()
+                            .collect::<Vec<_>>();
+                        let mut successors = edges
+                            .into_iter()
+                            .map(|(target, loader)| (indices[&target], loader.map(local_set)))
+                            .collect::<Vec<_>>();
+                        successors.sort_unstable();
+                        AsyncLoaderAvailabilityNode {
+                            observed,
+                            successors,
+                        }
+                    })
+                    .collect();
+                let mut group_order = chunk_groups.iter().collect::<Vec<_>>();
+                group_order.sort_unstable_by_key(|group| group_ranks[*group as usize]);
+                Some(AsyncLoaderAvailabilityGraph {
+                    root: indices[&index],
+                    nodes,
+                    sets: local_sets,
+                    group_order,
+                })
+            } else {
+                None
+            };
             Some((
                 module,
                 AsyncLoaderRelevantAvailability {
@@ -1366,6 +1560,7 @@ fn compute_async_loader_relevant_availability<'a>(
                     chunk_groups,
                     uses_entry_group: *uses_entry_group || *reaches_activatable,
                     reaches_activatable: *reaches_activatable,
+                    conditional,
                 },
             ))
         })
@@ -1373,16 +1568,124 @@ fn compute_async_loader_relevant_availability<'a>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use turbo_bitset::Bitset;
 
-    use super::AsyncLoaderRelevantAvailability;
+    use super::{
+        AsyncLoaderAvailabilityGraph, AsyncLoaderAvailabilityNode, AsyncLoaderRelevantAvailability,
+    };
+
+    fn bitset(values: &[u32]) -> Bitset {
+        values.iter().copied().collect()
+    }
 
     /// All subsets of `0..n`, as bitsets.
     fn subsets(n: u32) -> Vec<Bitset> {
         (0..1u32 << n)
             .map(|mask| (0..n).filter(|i| mask & (1 << i) != 0).collect())
             .collect()
+    }
+
+    #[test]
+    fn conditional_availability_avoids_expanding_equivalent_groups() {
+        let graph = AsyncLoaderAvailabilityGraph {
+            root: 0,
+            nodes: vec![AsyncLoaderAvailabilityNode {
+                observed: vec![0],
+                successors: vec![],
+            }],
+            sets: vec![(0..4096).collect()],
+            group_order: (0..4096).collect(),
+        };
+        let canonical = graph.canonicalize(&bitset(&[4095]));
+        assert_eq!(canonical.count_ones(), 1);
+        assert_eq!(graph.canonicalize(&bitset(&[2048])), canonical);
+        assert_eq!(graph.canonicalize(&canonical), canonical);
+    }
+
+    pub(crate) fn conditional_observations(
+        graph: &AsyncLoaderAvailabilityGraph,
+        available: &Bitset,
+    ) -> Vec<(u32, bool)> {
+        // Independent fixed-point reachability oracle.
+        let mut reachable = std::collections::BTreeSet::from([graph.root]);
+        loop {
+            let previous = reachable.clone();
+            for node in &previous {
+                for &(target, guard) in &graph.nodes[*node as usize].successors {
+                    if guard.is_none_or(|guard| graph.sets[guard as usize].is_disjoint(available)) {
+                        reachable.insert(target);
+                    }
+                }
+            }
+            if reachable == previous {
+                break;
+            }
+        }
+        let mut observed = std::collections::BTreeSet::new();
+        for node in reachable {
+            let node = &graph.nodes[node as usize];
+            observed.extend(node.observed.iter().copied());
+            observed.extend(node.successors.iter().filter_map(|(_, guard)| *guard));
+        }
+        observed
+            .into_iter()
+            .map(|set| (set, !graph.sets[set as usize].is_disjoint(available)))
+            .collect()
+    }
+
+    /// Exhaust every initial availability and every later addition for graphs with both
+    /// guarded async edges and unconditional shared edges. Observations include the guards
+    /// themselves: preserving emitted modules alone would not preserve nested loader creation.
+    #[test]
+    fn conditional_availability_preserves_reachable_observations() {
+        let sets = vec![
+            bitset(&[0]),
+            bitset(&[1]),
+            bitset(&[2]),
+            bitset(&[3]),
+            bitset(&[0, 3]),
+            bitset(&[1, 2]),
+        ];
+        for shared in [false, true] {
+            for root in 0..3 {
+                let graph = AsyncLoaderAvailabilityGraph {
+                    root,
+                    sets: sets.clone(),
+                    group_order: (0..4).collect(),
+                    nodes: vec![
+                        AsyncLoaderAvailabilityNode {
+                            observed: vec![0, 5],
+                            successors: vec![(1, Some(4)), (2, shared.then_some(1))],
+                        },
+                        AsyncLoaderAvailabilityNode {
+                            observed: vec![1],
+                            successors: vec![(2, Some(0))],
+                        },
+                        AsyncLoaderAvailabilityNode {
+                            observed: vec![2, 3],
+                            successors: vec![(0, Some(5))],
+                        },
+                    ],
+                };
+                for mask in 0..16u32 {
+                    let available = (0..4)
+                        .filter(|bit| mask & (1 << bit) != 0)
+                        .collect::<Bitset>();
+                    let canonical = graph.canonicalize(&available);
+                    assert_eq!(graph.canonicalize(&canonical), canonical);
+                    for extra in 0..16u32 {
+                        let extra = (0..4)
+                            .filter(|bit| extra & (1 << bit) != 0)
+                            .collect::<Bitset>();
+                        assert_eq!(
+                            conditional_observations(&graph, &union(&available, &extra)),
+                            conditional_observations(&graph, &union(&canonical, &extra))
+                        );
+                    }
+                }
+            }
+        }
     }
 
     fn hits(observed: &[Bitset], available: &Bitset) -> Vec<bool> {
@@ -1421,6 +1724,7 @@ mod tests {
                         chunk_groups,
                         uses_entry_group: false,
                         reaches_activatable: false,
+                        conditional: None,
                     };
                     let observed = &relevant.observed_chunk_groups;
                     let subset_only = AsyncLoaderRelevantAvailability {

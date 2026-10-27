@@ -2170,7 +2170,7 @@ impl Visit<SingleModuleGraphBuilderNode, RefData> for SingleModuleGraphBuilder<'
 #[cfg(test)]
 pub mod tests {
     use anyhow::Result;
-    use rustc_hash::FxHashMap;
+    use rustc_hash::{FxHashMap, FxHashSet};
     use turbo_bitset::Bitset;
     use turbo_rcstr::{RcStr, rcstr};
     use turbo_tasks::{
@@ -4271,7 +4271,8 @@ pub mod tests {
             let result = availability
                 .for_async_loader(module_graph, by_name[&module])
                 .await?;
-            // The canonical availability must answer every observed test like the original one.
+            // Preserve every reachable test. An available loader cuts off its target, so the
+            // unconditional closure may contain tests that the chunker cannot perform.
             if let Some(relevant) = info
                 .async_loader_relevant_availability
                 .get(&by_name[&module])
@@ -4285,12 +4286,20 @@ pub mod tests {
                 };
                 let before = chunk_groups(availability).await?;
                 let after = chunk_groups(result).await?;
-                for observed in &relevant.observed_chunk_groups {
+                if let Some(graph) = &relevant.conditional {
+                    use crate::module_graph::chunk_group_info::tests::conditional_observations;
                     assert_eq!(
-                        observed.is_disjoint(&before),
-                        observed.is_disjoint(&after),
-                        "canonical availability changes the test for {observed:?}"
+                        conditional_observations(graph, &before),
+                        conditional_observations(graph, &after)
                     );
+                } else {
+                    for observed in &relevant.observed_chunk_groups {
+                        assert_eq!(
+                            observed.is_disjoint(&before),
+                            observed.is_disjoint(&after),
+                            "canonical availability changes the test for {observed:?}"
+                        );
+                    }
                 }
             }
             let available = match result.available_chunk_groups() {
@@ -4390,28 +4399,27 @@ pub mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_async_loader_availability_shared_with_all_pages() {
         run_turbo_test(async {
-            let test = AsyncAvailabilityTest::new(
-                &[
-                    ("p1.js", &["lazy.js", "runtime.js"]),
-                    ("p2.js", &["lazy.js", "runtime.js"]),
-                    ("lazy.js", &["runtime.js", "leaf.js"]),
-                ],
-                &[("p1.js", "lazy.js", "async"), ("p2.js", "lazy.js", "async")],
-                &["p1.js", "p2.js"],
-                &[],
-            )
-            .await?;
-            let report = test
-                .report(&[(&["p1.js"], true, "lazy.js"), (&["p2.js"], true, "lazy.js")])
+            for entries in [["p1.js", "p2.js"], ["p2.js", "p1.js"]] {
+                let test = AsyncAvailabilityTest::new(
+                    &[
+                        ("p1.js", &["lazy.js", "runtime.js"]),
+                        ("p2.js", &["lazy.js", "runtime.js"]),
+                        ("lazy.js", &["runtime.js", "leaf.js"]),
+                    ],
+                    &[("p1.js", "lazy.js", "async"), ("p2.js", "lazy.js", "async")],
+                    &entries,
+                    &[],
+                )
                 .await?;
-            let (p1_before, p1, ref p1_available) = report.narrowed[0];
-            let (p2_before, p2, _) = report.narrowed[1];
-            assert_ne!(p1_before, p2_before);
-            assert_eq!(p1, p2);
-            assert_eq!(
-                p1_available,
-                &vec!["entry p1.js".to_string(), "entry p2.js".to_string()]
-            );
+                let report = test
+                    .report(&[(&["p1.js"], true, "lazy.js"), (&["p2.js"], true, "lazy.js")])
+                    .await?;
+                let (p1_before, p1, ref p1_available) = report.narrowed[0];
+                let (p2_before, p2, _) = report.narrowed[1];
+                assert_ne!(p1_before, p2_before);
+                assert_eq!(p1, p2);
+                assert_eq!(p1_available, &vec!["entry p1.js".to_string()]);
+            }
             Ok(())
         })
         .await
@@ -4460,6 +4468,137 @@ pub mod tests {
                 from_both.available_chunk_groups(),
                 from_p1.available_chunk_groups()
             );
+            Ok(())
+        })
+        .await
+    }
+
+    #[turbo_tasks::function(operation, root)]
+    async fn overlapping_async_loader_key_count(
+        module_graph: ResolvedVc<ModuleGraph>,
+        entries: Vec<ResolvedVc<Box<dyn Module>>>,
+        layers: Vec<Vec<ResolvedVc<Box<dyn Module>>>>,
+    ) -> Result<Vc<usize>> {
+        let mut parents = Vec::new();
+        for entry in entries {
+            parents.push(
+                AvailabilityInfo::root()
+                    .with_chunk_group(module_graph, ChunkGroupKey::Entry(vec![entry]))
+                    .await?
+                    .with_entry_group(ResolvedVc::cell(vec![entry]))
+                    .in_async_module(),
+            );
+        }
+
+        let mut key_count = 0;
+        for (depth, layer) in layers.into_iter().enumerate() {
+            let mut children = Vec::new();
+            for module in layer {
+                let mut variants = FxHashSet::default();
+                for parent in &parents {
+                    variants.insert(parent.for_async_loader(module_graph, module).await?);
+                }
+                // These are the availability inputs to the loader task. Both paths make the
+                // same modules available below this layer, even though their ancestors differ.
+                // Assert at every layer so a regression fails before enumerating 2^depth paths.
+                assert_eq!(variants.len(), 1, "distinct loader keys at depth {depth}");
+                key_count += variants.len();
+                for availability in variants {
+                    children.push(
+                        availability
+                            .with_chunk_group(module_graph, ChunkGroupKey::Async(module))
+                            .await?,
+                    );
+                }
+            }
+            parents = children;
+        }
+        Ok(Vc::cell(key_count))
+    }
+
+    /// A layered diamond graph has exponentially many import histories but only two targets per
+    /// layer. Bound the number of distinct loader task keys without relying on timing or memory
+    /// limits. A module shared with both entries and every async target must not prevent sharing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_async_loader_availability_deep_overlap() {
+        run_turbo_test(async {
+            const DEPTH: usize = 32;
+            for (shared, cyclic, cut) in [
+                (false, false, false),
+                (true, false, false),
+                (false, true, false),
+                (true, true, false),
+                (false, false, true),
+            ] {
+                let entries = vec![rcstr!("p1.js"), rcstr!("p2.js")];
+                let layers = (0..DEPTH)
+                    .map(|depth| {
+                        (0..2)
+                            .map(|branch| RcStr::from(format!("n{depth}_{branch}.js")))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>();
+                let mut dependencies = Vec::new();
+                let mut chunking_types = Vec::new();
+                for (index, parents) in std::iter::once(&entries).chain(layers.iter()).enumerate() {
+                    let mut children = layers.get(index).cloned().unwrap_or_else(|| {
+                        if cyclic {
+                            layers[1].clone()
+                        } else {
+                            Vec::new()
+                        }
+                    });
+                    if cut {
+                        children.push(rcstr!("sink.js"));
+                    }
+                    for parent in parents {
+                        let mut deps = children.clone();
+                        if shared {
+                            deps.push(rcstr!("runtime.js"));
+                        }
+                        if cut && index > 0 {
+                            deps.push(RcStr::from(format!("payload_{parent}")));
+                        }
+                        dependencies.push((parent.clone(), deps));
+                        chunking_types.extend(
+                            children
+                                .iter()
+                                .map(|child| (parent.clone(), child.clone(), rcstr!("async"))),
+                        );
+                    }
+                }
+                if cut {
+                    let payloads = layers
+                        .iter()
+                        .flatten()
+                        .map(|n| RcStr::from(format!("payload_{n}")))
+                        .collect::<Vec<_>>();
+                    dependencies.push((rcstr!("sink.js"), payloads.clone()));
+                    dependencies.extend(payloads.into_iter().map(|n| (n, Vec::new())));
+                }
+                let setup = async_availability_test_graph(
+                    dependencies,
+                    chunking_types,
+                    entries.clone(),
+                    vec![],
+                )
+                .read_strongly_consistent()
+                .await?;
+                let modules = |names: Vec<RcStr>| {
+                    names.into_iter().map(|name| setup.modules[&name]).collect()
+                };
+                // Check the nested-path case independently of cross-entry sharing.
+                for entry_count in 1..=entries.len() {
+                    let count = overlapping_async_loader_key_count(
+                        setup.module_graph,
+                        modules(entries[..entry_count].to_vec()),
+                        layers.iter().cloned().map(modules).collect(),
+                    )
+                    .read_strongly_consistent()
+                    .await?;
+                    assert_eq!(*count, DEPTH * 2);
+                }
+            }
             Ok(())
         })
         .await
@@ -4798,11 +4937,11 @@ pub mod tests {
                     Some(relevant("a.js", &groups, true))
                 );
                 // An unrelated target is still canonical: both pages get the same availability,
-                // which isn't a subset of either page's.
+                // with one stable witness for the shared runtime.
                 let (_, from_p1, ref from_p1_available) = report.narrowed[2];
                 let (_, from_p2, _) = report.narrowed[3];
                 assert_eq!(from_p1, from_p2);
-                assert!(from_p1_available.contains(&"entry p2.js".to_string()));
+                assert_eq!(from_p1_available, &vec!["async a.js".to_string()]);
             }
 
             // The containing target uses the subset filter and keeps the entry group.
@@ -4878,6 +5017,7 @@ pub mod tests {
             chunk_groups: Default::default(),
             uses_entry_group,
             reaches_activatable: false,
+            conditional: None,
         };
         Ok(Vc::cell(FxHashMap::from_iter([
             (a, entry(step >= 3)),
