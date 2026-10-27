@@ -33,7 +33,8 @@ use turbopack_core::{
     output::{ExpandedOutputAssets, OutputAsset},
     raw_module::RawModule,
     reference_type::{
-        CssReferenceSubType, EcmaScriptModulesReferenceSubType, InnerAssets, ReferenceType,
+        CommonJsReferenceSubType, CssReferenceSubType, EcmaScriptModulesReferenceSubType,
+        InnerAssets, ReferenceType,
     },
     resolve::{
         ExternalTraced, ExternalType, ModulePart, ModuleResolveResult, ModuleResolveResultItem,
@@ -1015,6 +1016,24 @@ impl AssetContext for ModuleAssetContext {
         reference_type: ReferenceType,
     ) -> Result<Vc<ModuleResolveResult>> {
         let this = self.await?;
+
+        if matches!(
+            reference_type,
+            ReferenceType::CommonJs(CommonJsReferenceSubType::ChildProcessFork)
+        ) {
+            // Forked files execute unbundled. Trace their original dependencies with Node
+            // resolution instead of pulling transformed or synthetic modules into the trace.
+            return Ok(externals_tracing_module_context(
+                *this.compile_time_info,
+                false,
+                None,
+                true,
+            )
+            .process_resolve_result(
+                result,
+                ReferenceType::CommonJs(CommonJsReferenceSubType::Undefined),
+            ));
+        }
 
         let replace_externals = this.replace_externals;
         let import_externals = this

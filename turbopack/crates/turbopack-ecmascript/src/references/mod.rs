@@ -37,7 +37,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use bumpalo::boxed::Box as BumpBox;
 use constant_condition::{ConstantConditionCodeGen, ConstantConditionValue};
-use constant_value::ConstantValueCodeGen;
+use constant_value::{ConstantValueCodeGen, InputRelativeCodeGen};
 use indexmap::map::Entry;
 use num_traits::Zero;
 use parking_lot::Mutex;
@@ -2016,6 +2016,17 @@ enum ValueLinkContext {
     InAlternative,
 }
 
+/// A completely dynamic URL alternative may be a runtime blob or remote URL. There is no
+/// bounded set of local assets to resolve, even when another alternative is a constant.
+fn has_unbounded_url_alternative(pattern: &Pattern) -> bool {
+    match pattern {
+        Pattern::Alternatives(alternatives) => {
+            alternatives.iter().any(has_unbounded_url_alternative)
+        }
+        _ => !pattern.has_constant_parts(),
+    }
+}
+
 async fn handle_well_known_function_call<'a, 'l, F, Fut>(
     func: WellKnownFunctionKind<'a>,
     new: bool,
@@ -2094,7 +2105,7 @@ where
                     && meta_prop.as_str() == "url"
                 {
                     let pat = js_value_to_pattern(url);
-                    if !pat.has_constant_parts() {
+                    if has_unbounded_url_alternative(&pat) {
                         let (args, hints) = explain_args(args);
                         handler.span_warn_with_code(
                             span,
@@ -2104,9 +2115,9 @@ where
                                     .to_string(),
                             ),
                         );
-                        if ignore_dynamic_requests {
-                            return Ok(());
-                        }
+                        // Preserve runtime URL construction, as for an opaque Worker argument.
+                        // Resolving it as a module would turn valid blob URLs into build errors.
+                        return Ok(());
                     }
                     let error_mode = if in_try {
                         ResolveErrorMode::Warn
@@ -2138,7 +2149,7 @@ where
                         _ => unreachable!(),
                     };
                     let pat = js_value_to_pattern(url);
-                    if !pat.has_constant_parts() {
+                    if has_unbounded_url_alternative(&pat) {
                         let (args, hints) = explain_args(args);
                         handler.span_warn_with_code(
                             span,
@@ -2147,9 +2158,7 @@ where
                                 errors::failed_to_analyze::ecmascript::NEW_WORKER.to_string(),
                             ),
                         );
-                        if ignore_dynamic_requests {
-                            return Ok(());
-                        }
+                        return Ok(());
                     }
 
                     if *compile_time_info.environment().rendering().await? == Rendering::Client {
@@ -2804,6 +2813,7 @@ where
                                 Request::parse(pat),
                                 issue_source(source, span),
                                 error_mode,
+                                false,
                             )
                             .to_resolved()
                             .await?,
@@ -2878,12 +2888,29 @@ where
                 } else {
                     ResolveErrorMode::Error
                 };
+                // __dirname/path.join evaluates to our virtual filesystem path. It is a
+                // filesystem location, not a server-root-relative module specifier.
+                let request = if let Pattern::Constant(path) = &pat
+                    && let Some(path) = path.strip_prefix("/ROOT/")
+                {
+                    let source_path = &source.ident().await?.path;
+                    let target = source_path.root().await?.join(path)?;
+                    Request::parse(Pattern::Constant(
+                        source_path
+                            .parent()
+                            .get_relative_request_to(&target)
+                            .context("fork target must be on the source filesystem")?,
+                    ))
+                } else {
+                    Request::parse(pat)
+                };
                 analysis.add_reference(
                     CjsAssetReference::new(
                         *origin,
-                        Request::parse(pat),
+                        request,
                         issue_source(source, span),
                         error_mode,
+                        true,
                     )
                     .to_resolved()
                     .await?,
@@ -3091,6 +3118,7 @@ where
                                         Request::parse(pat),
                                         issue_source(source, span),
                                         error_mode,
+                                        false,
                                     )
                                     .to_resolved()
                                     .await?,
@@ -3176,6 +3204,7 @@ where
                         Request::parse(js_value_to_pattern(&args[1])),
                         issue_source(source, span),
                         error_mode,
+                        false,
                     )
                     .to_resolved()
                     .await?,
@@ -3893,10 +3922,22 @@ async fn handle_free_var_reference(
                 InputRelativeConstant::DirName => source_path.parent(),
                 InputRelativeConstant::FileName => source_path,
             };
-            analysis.add_code_gen(ConstantValueCodeGen::new(
-                as_abs_path(source_path).into(),
-                analysis.intern_path(ast_path),
-            ));
+            if *state
+                .compile_time_info
+                .environment()
+                .node_externals()
+                .await?
+            {
+                analysis.add_code_gen(InputRelativeCodeGen::new(
+                    source_path,
+                    analysis.intern_path(ast_path),
+                ));
+            } else {
+                analysis.add_code_gen(ConstantValueCodeGen::new(
+                    as_abs_path(source_path).into(),
+                    analysis.intern_path(ast_path),
+                ));
+            }
         }
         FreeVarReference::ReportUsage {
             message,
@@ -4123,13 +4164,9 @@ async fn analyze_amd_define_with_deps(
     Ok(())
 }
 
-/// Used to generate the "root" path to a __filename/__dirname/import.meta.url
-/// reference.
+/// Symbolic absolute path for dependency analysis and non-Node placeholders.
+/// Node source globals use InputRelativeCodeGen to resolve the runtime root.
 pub fn as_abs_path(path: FileSystemPath) -> String {
-    // TODO: This should be updated to generate a real system path on the fly
-    // during runtime, so that the generated code is constant between systems
-    // but the runtime evaluation can take into account the project's
-    // actual root directory.
     require_resolve(path)
 }
 
