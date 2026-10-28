@@ -33,6 +33,8 @@ impl InnerAssets {
 #[turbo_tasks::task_input]
 #[derive(PartialEq, Eq, Debug, Default, Clone, Copy, Hash, Encode, Decode)]
 pub enum CommonJsReferenceSubType {
+    /// A child process runs the original file with Node resolution, outside the bundle.
+    ChildProcessFork,
     Custom(u8),
     #[default]
     Undefined,

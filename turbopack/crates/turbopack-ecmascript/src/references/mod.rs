@@ -2804,6 +2804,7 @@ where
                                 Request::parse(pat),
                                 issue_source(source, span),
                                 error_mode,
+                                false,
                             )
                             .to_resolved()
                             .await?,
@@ -2878,12 +2879,29 @@ where
                 } else {
                     ResolveErrorMode::Error
                 };
+                // __dirname/path.join evaluates to our virtual filesystem path. It is a
+                // filesystem location, not a server-root-relative module specifier.
+                let request = if let Pattern::Constant(path) = &pat
+                    && let Some(path) = path.strip_prefix("/ROOT/")
+                {
+                    let source_path = &source.ident().await?.path;
+                    let target = source_path.root().await?.join(path)?;
+                    Request::parse(Pattern::Constant(
+                        source_path
+                            .parent()
+                            .get_relative_request_to(&target)
+                            .context("fork target must be on the source filesystem")?,
+                    ))
+                } else {
+                    Request::parse(pat)
+                };
                 analysis.add_reference(
                     CjsAssetReference::new(
                         *origin,
-                        Request::parse(pat),
+                        request,
                         issue_source(source, span),
                         error_mode,
+                        true,
                     )
                     .to_resolved()
                     .await?,
@@ -3091,6 +3109,7 @@ where
                                         Request::parse(pat),
                                         issue_source(source, span),
                                         error_mode,
+                                        false,
                                     )
                                     .to_resolved()
                                     .await?,
@@ -3176,6 +3195,7 @@ where
                         Request::parse(js_value_to_pattern(&args[1])),
                         issue_source(source, span),
                         error_mode,
+                        false,
                     )
                     .to_resolved()
                     .await?,

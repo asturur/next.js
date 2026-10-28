@@ -14,7 +14,7 @@ use swc_core::{
 use turbo_rcstr::{RcStr, rcstr};
 use turbo_tasks::{NonLocalValue, ResolvedVc, ValueToString, Vc, debug::ValueDebugFormat};
 use turbopack_core::{
-    chunk::{ChunkingContext, ChunkingType},
+    chunk::{ChunkingContext, ChunkingType, TracedMode},
     issue::IssueSource,
     module::Module,
     reference::ModuleReference,
@@ -46,6 +46,7 @@ pub struct CjsAssetReference {
     pub request: ResolvedVc<Request>,
     pub issue_source: IssueSource,
     pub error_mode: ResolveErrorMode,
+    pub is_trace_entry: bool,
 }
 
 #[turbo_tasks::value_impl]
@@ -56,12 +57,14 @@ impl CjsAssetReference {
         request: ResolvedVc<Request>,
         issue_source: IssueSource,
         error_mode: ResolveErrorMode,
+        is_trace_entry: bool,
     ) -> Result<Vc<Self>> {
         Ok(Self::cell(CjsAssetReference {
             origin,
             request,
             issue_source,
             error_mode,
+            is_trace_entry,
         }))
     }
 }
@@ -73,16 +76,27 @@ impl ModuleReference for CjsAssetReference {
         cjs_resolve(
             *self.origin,
             *self.request,
-            CommonJsReferenceSubType::Undefined,
+            if self.is_trace_entry {
+                CommonJsReferenceSubType::ChildProcessFork
+            } else {
+                CommonJsReferenceSubType::Undefined
+            },
             Some(self.issue_source),
             self.error_mode,
         )
     }
 
     fn chunking_type(&self) -> Option<ChunkingType> {
-        Some(ChunkingType::Parallel {
-            inherit_async: false,
-            hoisted: false,
+        Some(if self.is_trace_entry {
+            // A child process executes the original file, so trace its full dependency tree.
+            ChunkingType::Traced {
+                mode: TracedMode::Entry,
+            }
+        } else {
+            ChunkingType::Parallel {
+                inherit_async: false,
+                hoisted: false,
+            }
         })
     }
 
