@@ -227,7 +227,7 @@ async fn all_assets_from_entries_filtered(
     exclude_glob: Option<Vc<Glob>>,
 ) -> Result<Vc<OutputAssets>> {
     let exclude_glob = if let Some(exclude_glob) = exclude_glob {
-        Some(exclude_glob.await?)
+        Some(exclude_glob.to_resolved().await?)
     } else {
         None
     };
@@ -268,7 +268,7 @@ async fn all_assets_from_entries_filtered(
 
 struct OutputAssetFilteredVisit {
     client_root: Option<FileSystemPath>,
-    exclude_glob: Option<ReadRef<Glob>>,
+    exclude_glob: Option<ResolvedVc<Glob>>,
     emit_spans: bool,
 }
 impl Visit<(ResolvedVc<Box<dyn OutputAsset>>, Option<ReadRef<RcStr>>)>
@@ -285,7 +285,7 @@ impl Visit<(ResolvedVc<Box<dyn OutputAsset>>, Option<ReadRef<RcStr>>)>
         node: &(ResolvedVc<Box<dyn OutputAsset>>, Option<ReadRef<RcStr>>),
     ) -> Self::EdgesFuture {
         let client_root = self.client_root.clone();
-        let exclude_glob: Option<ReadRef<Glob>> = self.exclude_glob.clone();
+        let exclude_glob: Option<ResolvedVc<Glob>> = self.exclude_glob.clone();
         get_referenced_server_assets(self.emit_spans, node.0, client_root, exclude_glob)
     }
 
@@ -308,32 +308,18 @@ async fn get_referenced_server_assets(
     emit_spans: bool,
     asset: ResolvedVc<Box<dyn OutputAsset>>,
     client_root: Option<FileSystemPath>,
-    exclude_glob: Option<ReadRef<Glob>>,
+    exclude_glob: Option<ResolvedVc<Glob>>,
 ) -> Result<
     Vec<(
         (ResolvedVc<Box<dyn OutputAsset>>, Option<ReadRef<RcStr>>),
         (),
     )>,
 > {
-    let refs = asset.references().all_assets().await?;
+    let refs =
+        filtered_asset_references(*asset, client_root, exclude_glob.map(|glob| *glob)).await?;
 
     refs.iter()
         .map(async |asset| {
-            let asset_path = asset.path().await?;
-
-            if let Some(client_root) = &client_root
-                && asset_path.is_inside_ref(client_root)
-            {
-                return Ok(None);
-            }
-
-            if exclude_glob
-                .as_ref()
-                .is_some_and(|g| g.matches(&asset_path.path))
-            {
-                return Ok(None);
-            }
-
             Ok(Some((
                 (
                     *asset,
@@ -350,4 +336,178 @@ async fn get_referenced_server_assets(
         })
         .try_flat_join()
         .await
+}
+
+/// Cache direct, filtered edges per asset. Many endpoints share the same server chunks;
+/// reading every descendant path in each endpoint's traversal repeats dependency
+/// bookkeeping. A change to one asset only invalidates consumers of that asset's edges.
+#[turbo_tasks::function]
+async fn filtered_asset_references(
+    asset: ResolvedVc<Box<dyn OutputAsset>>,
+    client_root: Option<FileSystemPath>,
+    exclude_glob: Option<ResolvedVc<Glob>>,
+) -> Result<Vc<OutputAssets>> {
+    let refs = asset.references().all_assets().await?;
+    let exclude_glob = if let Some(glob) = exclude_glob {
+        Some(glob.await?)
+    } else {
+        None
+    };
+    Ok(Vc::cell(
+        refs.iter()
+            .map(async |asset| {
+                let asset_path = asset.path().await?;
+                if client_root
+                    .as_ref()
+                    .is_some_and(|root| asset_path.is_inside_ref(root))
+                    || exclude_glob
+                        .as_ref()
+                        .is_some_and(|glob| glob.matches(&asset_path.path))
+                {
+                    return Ok(None);
+                }
+                Ok(Some(*asset))
+            })
+            .try_flat_join()
+            .await?,
+    ))
+}
+
+#[cfg(test)]
+mod filtered_edge_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use anyhow::Result;
+    use turbo_rcstr::{RcStr, rcstr};
+    use turbo_tasks::{ResolvedVc, State, Vc};
+    use turbo_tasks_backend::{BackendOptions, TurboTasksBackend, noop_backing_storage};
+    use turbo_tasks_fs::{
+        File, FileContent, FileSystem, FileSystemPath, VirtualFileSystem,
+        glob::{Glob, GlobOptions},
+    };
+    use turbopack_core::{
+        asset::{Asset, AssetContent},
+        output::{OutputAsset, OutputAssetsReference, OutputAssetsWithReferenced},
+    };
+
+    use super::filtered_asset_references;
+
+    #[turbo_tasks::value]
+    struct TestAsset {
+        path: FileSystemPath,
+        children: Vec<ResolvedVc<Box<dyn OutputAsset>>>,
+        selected: State<Vec<usize>>,
+    }
+
+    #[turbo_tasks::value_impl]
+    impl Asset for TestAsset {
+        #[turbo_tasks::function]
+        fn content(&self) -> Vc<AssetContent> {
+            AssetContent::file(FileContent::Content(File::from("")).cell())
+        }
+    }
+
+    #[turbo_tasks::value_impl]
+    impl OutputAsset for TestAsset {
+        #[turbo_tasks::function]
+        fn path(&self) -> Vc<FileSystemPath> {
+            self.path.clone().cell()
+        }
+    }
+
+    #[turbo_tasks::value_impl]
+    impl OutputAssetsReference for TestAsset {
+        #[turbo_tasks::function]
+        fn references(&self) -> Vc<OutputAssetsWithReferenced> {
+            OutputAssetsWithReferenced::from_assets(Vc::cell(
+                self.selected
+                    .get()
+                    .iter()
+                    .map(|&index| self.children[index])
+                    .collect(),
+            ))
+        }
+    }
+
+    static EXECUTIONS: AtomicUsize = AtomicUsize::new(0);
+
+    #[turbo_tasks::value]
+    struct ReadResult {
+        paths: Vec<RcStr>,
+        execution: usize,
+    }
+
+    #[turbo_tasks::function(operation, root)]
+    async fn read_edges(
+        asset: ResolvedVc<Box<dyn OutputAsset>>,
+        client_root: FileSystemPath,
+        exclude: ResolvedVc<Glob>,
+    ) -> Result<Vc<ReadResult>> {
+        let edges = filtered_asset_references(*asset, Some(client_root), Some(*exclude)).await?;
+        let mut paths = Vec::new();
+        for edge in edges.iter() {
+            paths.push(edge.path().await?.path.clone());
+        }
+        Ok(ReadResult {
+            paths,
+            execution: EXECUTIONS.fetch_add(1, Ordering::SeqCst),
+        }
+        .cell())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn filtered_edges_preserve_exclusions_and_invalidate_only_affected_consumers() {
+        let tt = turbo_tasks::TurboTasks::new(TurboTasksBackend::new(
+            BackendOptions::default(),
+            noop_backing_storage(),
+        ));
+        tt.run_once(async {
+            let root = VirtualFileSystem::new_with_name(rcstr!("edges"))
+                .root()
+                .owned()
+                .await?;
+            let asset = |name: &str, children: Vec<ResolvedVc<Box<dyn OutputAsset>>>| {
+                TestAsset {
+                    path: root.join(name).unwrap(),
+                    children,
+                    selected: State::new(Vec::new()),
+                }
+                .resolved_cell()
+            };
+            let first = ResolvedVc::upcast(asset("server/first.js", vec![]));
+            let second = ResolvedVc::upcast(asset("server/second.js", vec![]));
+            let client = ResolvedVc::upcast(asset("client/page.js", vec![]));
+            let excluded = ResolvedVc::upcast(asset("server/excluded.js", vec![]));
+            let a = asset("server/a.js", vec![first, second, client, excluded]);
+            let b = asset("server/b.js", vec![first, second]);
+            a.await?.selected.set(vec![0, 2, 3]);
+            b.await?.selected.set(vec![1]);
+            let exclude = Glob::new(rcstr!("server/excluded.js"), GlobOptions::default())
+                .to_resolved()
+                .await?;
+            let read_a = read_edges(ResolvedVc::upcast(a), root.join("client")?, exclude);
+            let read_b = read_edges(ResolvedVc::upcast(b), root.join("client")?, exclude);
+            let a_before = read_a.read_strongly_consistent().await?;
+            let b_before = read_b.read_strongly_consistent().await?;
+            assert_eq!(a_before.paths, [rcstr!("server/first.js")]);
+            assert_eq!(b_before.paths, [rcstr!("server/second.js")]);
+            b.await?.selected.set(vec![0]);
+            let b_after = read_b.read_strongly_consistent().await?;
+            let a_after = read_a.read_strongly_consistent().await?;
+            assert_eq!(b_after.paths, [rcstr!("server/first.js")]);
+            assert_ne!(b_after.execution, b_before.execution);
+            assert_eq!(a_after.execution, a_before.execution);
+            a.await?.selected.set(vec![1, 2, 3]);
+            let a_changed = read_a.read_strongly_consistent().await?;
+            assert_eq!(a_changed.paths, [rcstr!("server/second.js")]);
+            assert_ne!(a_changed.execution, a_before.execution);
+            assert_eq!(
+                read_b.read_strongly_consistent().await?.execution,
+                b_after.execution
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
 }
