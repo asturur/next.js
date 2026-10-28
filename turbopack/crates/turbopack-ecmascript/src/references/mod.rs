@@ -2016,6 +2016,17 @@ enum ValueLinkContext {
     InAlternative,
 }
 
+/// A completely dynamic URL alternative may be a runtime blob or remote URL. There is no
+/// bounded set of local assets to resolve, even when another alternative is a constant.
+fn has_unbounded_url_alternative(pattern: &Pattern) -> bool {
+    match pattern {
+        Pattern::Alternatives(alternatives) => {
+            alternatives.iter().any(has_unbounded_url_alternative)
+        }
+        _ => !pattern.has_constant_parts(),
+    }
+}
+
 async fn handle_well_known_function_call<'a, 'l, F, Fut>(
     func: WellKnownFunctionKind<'a>,
     new: bool,
@@ -2094,7 +2105,7 @@ where
                     && meta_prop.as_str() == "url"
                 {
                     let pat = js_value_to_pattern(url);
-                    if !pat.has_constant_parts() {
+                    if has_unbounded_url_alternative(&pat) {
                         let (args, hints) = explain_args(args);
                         handler.span_warn_with_code(
                             span,
@@ -2104,9 +2115,9 @@ where
                                     .to_string(),
                             ),
                         );
-                        if ignore_dynamic_requests {
-                            return Ok(());
-                        }
+                        // Preserve runtime URL construction, as for an opaque Worker argument.
+                        // Resolving it as a module would turn valid blob URLs into build errors.
+                        return Ok(());
                     }
                     let error_mode = if in_try {
                         ResolveErrorMode::Warn
@@ -2138,7 +2149,7 @@ where
                         _ => unreachable!(),
                     };
                     let pat = js_value_to_pattern(url);
-                    if !pat.has_constant_parts() {
+                    if has_unbounded_url_alternative(&pat) {
                         let (args, hints) = explain_args(args);
                         handler.span_warn_with_code(
                             span,
@@ -2147,9 +2158,7 @@ where
                                 errors::failed_to_analyze::ecmascript::NEW_WORKER.to_string(),
                             ),
                         );
-                        if ignore_dynamic_requests {
-                            return Ok(());
-                        }
+                        return Ok(());
                     }
 
                     if *compile_time_info.environment().rendering().await? == Rendering::Client {
