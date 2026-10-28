@@ -37,7 +37,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use bumpalo::boxed::Box as BumpBox;
 use constant_condition::{ConstantConditionCodeGen, ConstantConditionValue};
-use constant_value::ConstantValueCodeGen;
+use constant_value::{ConstantValueCodeGen, InputRelativeCodeGen};
 use indexmap::map::Entry;
 use num_traits::Zero;
 use parking_lot::Mutex;
@@ -3923,10 +3923,22 @@ async fn handle_free_var_reference(
                 InputRelativeConstant::DirName => source_path.parent(),
                 InputRelativeConstant::FileName => source_path,
             };
-            analysis.add_code_gen(ConstantValueCodeGen::new(
-                as_abs_path(source_path).into(),
-                analysis.intern_path(ast_path),
-            ));
+            if *state
+                .compile_time_info
+                .environment()
+                .node_externals()
+                .await?
+            {
+                analysis.add_code_gen(InputRelativeCodeGen::new(
+                    source_path,
+                    analysis.intern_path(ast_path),
+                ));
+            } else {
+                analysis.add_code_gen(ConstantValueCodeGen::new(
+                    as_abs_path(source_path).into(),
+                    analysis.intern_path(ast_path),
+                ));
+            }
         }
         FreeVarReference::ReportUsage {
             message,
@@ -4153,13 +4165,9 @@ async fn analyze_amd_define_with_deps(
     Ok(())
 }
 
-/// Used to generate the "root" path to a __filename/__dirname/import.meta.url
-/// reference.
+/// Symbolic absolute path for dependency analysis and non-Node placeholders.
+/// Node source globals use InputRelativeCodeGen to resolve the runtime root.
 pub fn as_abs_path(path: FileSystemPath) -> String {
-    // TODO: This should be updated to generate a real system path on the fly
-    // during runtime, so that the generated code is constant between systems
-    // but the runtime evaluation can take into account the project's
-    // actual root directory.
     require_resolve(path)
 }
 
