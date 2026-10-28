@@ -488,12 +488,19 @@ impl FileContent {
         match self {
             FileContent::Content(file) => {
                 let content = file.content.clone().into_bytes();
-                let de = &mut serde_json::Deserializer::from_slice(&content);
+                // Match JavaScript JSON module loaders: accept one leading UTF-8 BOM.
+                let json = content.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&content);
+                let bom_bytes = content.len() - json.len();
+                let de = &mut serde_json::Deserializer::from_slice(json);
                 match serde_path_to_error::deserialize(de) {
                     Ok(data) => FileJsonContent::Content(data),
-                    Err(e) => FileJsonContent::Unparsable(Box::new(
-                        UnparsableJson::from_serde_path_to_error(e),
-                    )),
+                    Err(e) => {
+                        let mut error = UnparsableJson::from_serde_path_to_error(e);
+                        if let Some((0, column)) = &mut error.start_location {
+                            *column += bom_bytes as u32;
+                        }
+                        FileJsonContent::Unparsable(Box::new(error))
+                    }
                 }
             }
             FileContent::NotFound => FileJsonContent::NotFound,
@@ -728,4 +735,35 @@ pub enum FileLinesContent {
     Lines(#[turbo_tasks(unsafe_ignore)] Vec<FileLine>),
     Unparsable,
     NotFound,
+}
+
+#[cfg(test)]
+mod json_bom_tests {
+    use super::{File, FileContent, FileJsonContent};
+
+    #[test]
+    fn accepts_one_leading_bom_without_changing_json_strings() {
+        for prefix in ["", "\u{feff}"] {
+            let file = FileContent::Content(File::from(format!(
+                "{prefix}{{\"value\":\"\u{feff}inside\"}}"
+            )));
+            let FileJsonContent::Content(value) = file.parse_json_ref() else {
+                panic!("valid JSON with an optional leading BOM must parse");
+            };
+            assert_eq!(value["value"], "\u{feff}inside");
+        }
+    }
+
+    #[test]
+    fn rejects_other_bom_positions_and_preserves_error_offset() {
+        for text in [" \u{feff}{}", "\u{feff}\u{feff}{}", "\u{feff}!"] {
+            let file = FileContent::Content(File::from(text));
+            let FileJsonContent::Unparsable(error) = file.parse_json_ref() else {
+                panic!("only one BOM at the start is accepted");
+            };
+            if text == "\u{feff}!" {
+                assert_eq!(error.start_location, Some((0, 3)));
+            }
+        }
+    }
 }
